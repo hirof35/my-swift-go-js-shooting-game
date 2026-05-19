@@ -1,0 +1,9 @@
+# Goのバイナリ（実行ファイル）
+*.exe
+*.exe~
+__debug_bin
+bin/
+
+# OSのキャッシュファイル
+.DS_Store
+Thumbs.db

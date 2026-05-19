@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Go × HTML5 シューティングゲーム</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #111;
+            color: white;
+            font-family: 'Helvetica', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #menu {
+            text-align: center;
+        }
+        .btn {
+            display: block;
+            width: 200px;
+            padding: 10px;
+            margin: 10px auto;
+            font-size: 18px;
+            font-weight: bold;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        #btn-easy { background-color: #2ecc71; color: white; }
+        #btn-normal { background-color: #f1c40f; color: black; }
+        #btn-hard { background-color: #e74c3c; color: white; }
+        
+        #gameCanvas {
+            background-color: black;
+            border: 2px solid #333;
+            display: none; /* 最初は隠しておく */
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 1. タイトルメニュー画面 -->
+    <div id="menu">
+        <h1 style="color: #00ffff;">GO × HTML5 SHOOTING</h1>
+        <p>難易度を選択してください</p>
+        <button class="btn" id="btn-easy" onclick="startGame('easy')">▶ EASY</button>
+        <button class="btn" id="btn-normal" onclick="startGame('normal')">▶ NORMAL</button>
+        <button class="btn" id="btn-hard" onclick="startGame('hard')">▶ HARD</button>
+    </div>
+
+    <!-- 2. ゲーム画面（キャンバス） -->
+    <canvas id="gameCanvas" width="375" height="600"></canvas>
+
+<script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    let ws;
+
+    // ゲーム内のオブジェクト管理
+    let player = { x: 187, y: 500, size: 40 };
+    let bullets = [];
+    let enemies = [];
+    let enemyBullets = []; // ★ 敵とボスの弾用の配列をしっかり定義
+    let boss = null;
+    let bossHPBar = null;
+    let particles = [];
+    let isGameOver = false;
+    let clearMessage = "";
+    let shakeTimer = 0;
+
+    // マウス・トラックパッドでの自機移動
+    canvas.addEventListener("mousemove", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        player.x = e.clientX - rect.left;
+    });
+
+    // ゲーム開始（難易度選択後の処理）
+    function startGame(difficulty) {
+        document.getElementById("menu").style.display = "none";
+        canvas.style.display = "block";
+
+        // Goサーバーへ接続 (Windowsローカルなので localhost でOK)
+        ws = new WebSocket("ws://localhost:8080/game");
+
+        ws.onopen = () => {
+            // 接続直後に難易度を送信
+            ws.send(JSON.stringify({ level: difficulty }));
+            // 自動連射スタート (0.18秒間隔)
+            setInterval(fireBullet, 180);
+            // ゲームループ（描画リフレッシュ）開始
+            gameLoop();
+        };
+
+        ws.onmessage = (event) => {
+            const res = JSON.parse(event.data);
+            handleServerResponse(res);
+        };
+    }
+
+    // サーバーからのデータ処理
+    function handleServerResponse(res) {
+        switch (res.type) {
+            case "enemy_spawn":
+                enemies.push({
+                    id: res.enemy_id,
+                    x: res.x,
+                    y: -20,
+                    size: 30,
+                    speedY: (canvas.height + 40) / (res.speed * 60),
+                    currentX: res.x // 現在位置を追跡用
+                });
+                break;
+
+            case "enemy_bullet":
+                // 敵の位置（Goから届いた出現X座標）ベースで、下向きに弾を撃ち出す
+                enemyBullets.push({
+                    x: res.x,
+                    y: 40,            // 画面上部付近
+                    vx: 0,
+                    vy: 4,            // 下に向かう速度
+                    size: 5,
+                    color: "#ff4757"  // 赤い弾
+                });
+                break;
+
+            case "boss_bullet":
+                if (!boss) break;
+                if (res.attack_pattern === "normal") {
+                    // 通常攻撃：3方向（扇状）に撃ち出す
+                    const angles = [-0.2, 0, 0.2];
+                    angles.forEach(angle => {
+                        enemyBullets.push({
+                            x: boss.x,
+                            y: boss.y + 20,
+                            vx: Math.sin(angle) * 5,
+                            vy: Math.cos(angle) * 5,
+                            size: 7,
+                            color: "#ffa502" // オレンジの少し大きい弾
+                        });
+                    });
+                } else if (res.attack_pattern === "rage") {
+                    // 発狂攻撃：全方位（8方向）に一斉にバラ撒く弾幕
+                    for (let i = 0; i < 8; i++) {
+                        let angle = (Math.PI * 2 / 8) * i;
+                        enemyBullets.push({
+                            x: boss.x,
+                            y: boss.y + 20,
+                            vx: Math.cos(angle) * 6,
+                            vy: Math.sin(angle) * 6,
+                            size: 6,
+                            color: "#ff007f" // 禍々しいピンクの弾幕
+                        });
+                    }
+                }
+                break;
+
+            case "boss_spawn":
+                boss = { x: canvas.width / 2, y: 120, width: 90, height: 70, color: "#9b59b6", dir: 1 };
+                bossHPBar = { current: res.current_hp, max: res.max_hp };
+                break;
+            case "boss_update":
+                if (bossHPBar) bossHPBar.current = res.current_hp;
+                if (res.attack_pattern === "rage" && boss) boss.color = "#ff0000";
+                break;
+            case "boss_exploding":
+                if (boss) { createExplosion(boss.x, boss.y, true); boss = null; shakeTimer = 30; }
+                break;
+            case "clear":
+                bossHPBar = null; clearMessage = "STAGE CLEAR ✨"; break;
+        }
+    }
+
+    // 弾の発射
+    function fireBullet() {
+        if (isGameOver || clearMessage) return;
+        bullets.push({ x: player.x, y: player.y - 20, size: 6 });
+    }
+
+    // 爆発パーティクルの生成
+    function createExplosion(x, y, isBig) {
+        const count = isBig ? 100 : 20;
+        for (let i = 0; i < count; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = Math.random() * (isBig ? 5 : 3) + 1;
+            particles.push({
+                x: x,
+                y: y,
+                vx: Math.cos(angle) * speed,
+                vy: Math.sin(angle) * speed,
+                alpha: 1,
+                decay: Math.random() * 0.03 + 0.02,
+                color: Math.random() > 0.5 ? "#ff9f43" : "#ffff00"
+            });
+        }
+    }
+
+    // メインのゲームループ（計算と描画）
+    function gameLoop() {
+        updatePhysics();
+        drawGame();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // 移動や当たり判定の計算
+    function updatePhysics() {
+        // プレイヤーの弾の移動
+        bullets.forEach((b, index) => {
+            b.y -= 10;
+            if (b.y < -10) bullets.splice(index, 1);
+        });
+
+        // 敵・ボスの弾の移動と、プレイヤー（自機）への当たり判定
+        enemyBullets.forEach((eb, index) => {
+            eb.x += eb.vx;
+            eb.y += eb.vy;
+            
+            // 画面外に出たら削除
+            if (eb.y > canvas.height + 10 || eb.x < -10 || eb.x > canvas.width + 10) {
+                enemyBullets.splice(index, 1);
+                return;
+            }
+
+            // 自機との当たり判定
+            if (!isGameOver && !clearMessage) {
+                if (Math.abs(eb.x - player.x) < 20 && Math.abs(eb.y - player.y) < 20) {
+                    isGameOver = true; // 被弾したら一発アウト
+                    createExplosion(player.x, player.y, false);
+                }
+            }
+        });
+
+        // 敵の移動と、自機本体との衝突判定
+        enemies.forEach((e, index) => {
+            e.y += e.speedY;
+            if (e.y > canvas.height + 20) enemies.splice(index, 1);
+            if (Math.abs(e.x - player.x) < 30 && Math.abs(e.y - player.y) < 30) {
+                isGameOver = true;
+            }
+        });
+
+        // ボスの移動
+        if (boss) {
+            boss.x += boss.dir * 2;
+            if (boss.x > canvas.width - 45 || boss.x < 45) boss.dir *= -1;
+        }
+
+        // プレイヤーの弾が敵やボスに当たったかの判定
+        bullets.forEach((b, bIdx) => {
+            enemies.forEach((e, eIdx) => {
+                if (Math.abs(b.x - e.x) < 20 && Math.abs(b.y - e.y) < 20) {
+                    createExplosion(e.x, e.y, false);
+                    enemies.splice(eIdx, 1);
+                    bullets.splice(bIdx, 1);
+                }
+            });
+            if (boss && Math.abs(b.x - boss.x) < 45 && Math.abs(b.y - boss.y) < 35) {
+                bullets.splice(bIdx, 1);
+                ws.send(JSON.stringify({ action: "damage" }));
+            }
+        });
+
+        // パーティクル
+        particles.forEach((p, index) => {
+            p.x += p.vx; p.y += p.vy; p.alpha -= p.decay;
+            if (p.alpha <= 0) particles.splice(index, 1);
+        });
+    }
+
+    // 画面の描画
+    function drawGame() {
+        // 最初に画面全体をクリアする（重複していた後半のクリアやセーブは削除して一本化）
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        ctx.save();
+        // 画面シェイクエフェクト
+        if (shakeTimer > 0) {
+            const dx = (Math.random() - 0.5) * 10;
+            const dy = (Math.random() - 0.5) * 10;
+            ctx.translate(dx, dy);
+            shakeTimer--;
+        }
+
+        // 自機の描画（青）
+        if (!isGameOver) {
+            ctx.fillStyle = "#00ffff";
+            ctx.fillRect(player.x - player.size/2, player.y - player.size/2, player.size, player.size);
+        }
+
+        // プレイヤーの弾の描画（オレンジ）
+        ctx.fillStyle = "#ff9f43";
+        bullets.forEach(b => {
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.size, 0, Math.PI*2);
+            ctx.fill();
+        });
+
+        // 敵・ボスの弾の描画（赤/ピンクなど）
+        enemyBullets.forEach(eb => {
+            ctx.fillStyle = eb.color;
+            ctx.beginPath();
+            ctx.arc(eb.x, eb.y, eb.size, 0, Math.PI*2);
+            ctx.fill();
+        });
+
+        // 敵の描画（マゼンタ）
+        ctx.fillStyle = "#e056fd";
+        enemies.forEach(e => {
+            ctx.fillRect(e.x - e.size/2, e.y - e.size/2, e.size, e.size);
+        });
+
+        // ボスの描画（紫/赤）
+        if (boss) {
+            ctx.fillStyle = boss.color;
+            ctx.fillRect(boss.x - boss.width/2, boss.y - boss.height/2, boss.width, boss.height);
+        }
+
+        // HPバーの描画
+        if (bossHPBar && boss) {
+            ctx.fillStyle = "#333";
+            ctx.fillRect(canvas.width/2 - 120, 40, 240, 12);
+            ctx.fillStyle = "#ff0000";
+            const width = 240 * (bossHPBar.current / bossHPBar.max);
+            ctx.fillRect(canvas.width/2 - 120, 40, width, 12);
+        }
+
+        // パーティクルの描画
+        particles.forEach(p => {
+            ctx.fillStyle = p.color;
+            ctx.globalAlpha = p.alpha;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
+            ctx.fill();
+        });
+        ctx.globalAlpha = 1.0;
+
+        ctx.restore(); // シェイクここまで
+
+        // UIテキストの表示
+        ctx.font = "bold 24px Helvetica";
+        ctx.textAlign = "center";
+
+        if (isGameOver) {
+            ctx.fillStyle = "#ff0000";
+            ctx.fillText("GAME OVER", canvas.width / 2, canvas.height / 2);
+        }
+        if (clearMessage) {
+            ctx.fillStyle = "#2ecc71";
+            ctx.fillText(clearMessage, canvas.width / 2, canvas.height / 2);
+        }
+    }
+</script>
+</body>
+</html>
